@@ -1,1 +1,23 @@
+name: Daily YouTube Upload
+
+on:
+  schedule:
+    - cron: '30 2 * * *'   # morning IST (08:00)
+    - cron: '30 8 * * *'   # afternoon IST (14:00)
+  workflow_dispatch:
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run bot
+        run: python main.py
 
