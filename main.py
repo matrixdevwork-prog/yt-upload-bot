@@ -1,203 +1,184 @@
 import os
-import io
 import json
-import datetime
+import io
+from datetime import datetime, timedelta
+import pytz
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-
-# ==================================================
+# =========================
 # ENV VARIABLES
-# ==================================================
+# =========================
 TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
 PENDING_FOLDER_ID = os.getenv("PENDING_FOLDER_ID")
 UPLOADED_FOLDER_ID = os.getenv("UPLOADED_FOLDER_ID")
 
 if not TOKEN_JSON:
     raise Exception("GOOGLE_TOKEN_JSON missing")
-if not PENDING_FOLDER_ID:
-    raise Exception("PENDING_FOLDER_ID missing")
-if not UPLOADED_FOLDER_ID:
-    raise Exception("UPLOADED_FOLDER_ID missing")
 
-print("✅ Environment variables loaded")
-
-
-# ==================================================
+# =========================
 # AUTH
-# ==================================================
+# =========================
 creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON))
 drive = build("drive", "v3", credentials=creds)
 youtube = build("youtube", "v3", credentials=creds)
 
-print("🚀 Bot started")
+print("✅ Environment variables loaded")
 
-
-# ==================================================
-# TITLE + TAGS FROM TXT
-# ==================================================
+# =========================
+# TITLE + TAG PICKER
+# =========================
 def get_title_from_file(path="titles.txt"):
+    if not os.path.exists(path):
+        raise Exception("titles.txt not found in repo root")
+
     with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+        lines = [l.strip() for l in f if l.strip()]
 
-    for i, line in enumerate(lines):
-        if "|" not in line:
-            continue
+    if not lines:
+        raise Exception("titles.txt is empty")
 
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) != 3:
-            continue
+    first = lines[0]
+    remaining = lines[1:]
 
-        status, title, tags = parts
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(remaining))
 
-        if status == "0":
-            # mark as used
-            lines[i] = f"1 | {title} | {tags}\n"
+    title, tags = first.split("|")
+    tag_list = [t.strip() for t in tags.split(",")]
 
-            with open(path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+    return title.strip(), tag_list
 
-            tag_list = tags.replace("#", "").split()
-            return title, tag_list, tags
+# =========================
+# DESCRIPTION BUILDER
+# =========================
+def build_description(title, tags):
+    hashtags = " ".join([f"#{t}" for t in tags])
 
-    raise Exception("❌ No unused titles left in titles.txt")
+    return f"""
+{title}
 
+🔥 Hulk AI Viral Short
+😂 Funny AI Generated Content
+🤖 Altered / AI Based Video
 
-# ==================================================
-# SCHEDULE TIME (IST → UTC)
-# ==================================================
-now_utc = datetime.datetime.utcnow()
-now_ist = now_utc + datetime.timedelta(hours=5, minutes=30)
+{hashtags}
+""".strip()
 
-if now_ist.hour < 12:
-    publish_ist = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
-else:
-    publish_ist = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+# =========================
+# SCHEDULE LOGIC (IST)
+# =========================
+def get_publish_time():
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
 
-if publish_ist <= now_ist:
-    publish_ist += datetime.timedelta(days=1)
+    if now.hour < 7:
+        publish = now.replace(hour=8, minute=0, second=0)
+    elif now.hour < 13:
+        publish = now.replace(hour=14, minute=0, second=0)
+    else:
+        publish = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0)
 
-publish_utc = publish_ist - datetime.timedelta(hours=5, minutes=30)
-publish_at = publish_utc.isoformat() + "Z"
+    print("📅 Scheduled publish (IST):", publish.strftime("%Y-%m-%d %H:%M"))
+    return publish.astimezone(pytz.utc).isoformat()
 
-print("📅 Scheduled publish (IST):", publish_ist.strftime("%Y-%m-%d %H:%M"))
-
-
-# ==================================================
-# PICK ONE FILE FROM PENDING
-# ==================================================
-res = drive.files().list(
-    q=f"'{PENDING_FOLDER_ID}' in parents and trashed=false",
-    fields="files(id,name,mimeType,shortcutDetails)",
-    pageSize=1
-).execute()
-
-files = res.get("files", [])
-if not files:
-    raise Exception("No video found in PENDING folder")
-
-file = files[0]
-file_id = file["id"]
-file_name = file["name"]
-
-print("🎬 Selected file:", file_name)
-
-
-# ==================================================
-# SHORTCUT RESOLVE
-# ==================================================
-real_file_id = file_id
-
-if file["mimeType"] == "application/vnd.google-apps.shortcut":
-    print("🔗 Shortcut detected, resolving real file...")
-    shortcut = drive.files().get(
-        fileId=file_id,
-        fields="shortcutDetails"
+# =========================
+# GET NEXT VIDEO
+# =========================
+def get_next_video():
+    results = drive.files().list(
+        q=f"'{PENDING_FOLDER_ID}' in parents and trashed=false",
+        fields="files(id,name,mimeType,shortcutDetails)"
     ).execute()
 
-    real_file_id = shortcut["shortcutDetails"]["targetId"]
+    files = results.get("files", [])
+    if not files:
+        raise Exception("No videos in pending folder")
 
-    real_meta = drive.files().get(
-        fileId=real_file_id,
-        fields="name"
-    ).execute()
+    f = files[0]
 
-    file_name = real_meta["name"]
-    print("Resolved to:", file_name)
+    # Handle shortcut
+    if f["mimeType"] == "application/vnd.google-apps.shortcut":
+        real_id = f["shortcutDetails"]["targetId"]
+        real = drive.files().get(fileId=real_id, fields="id,name").execute()
+        return real["id"], real["name"], f["id"]
 
+    return f["id"], f["name"], None
 
-# ==================================================
+# =========================
 # DOWNLOAD VIDEO
-# ==================================================
-request = drive.files().get_media(fileId=real_file_id)
-fh = io.FileIO("video.mp4", "wb")
-downloader = MediaIoBaseDownload(fh, request)
+# =========================
+def download_video(file_id, name):
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.FileIO(name, "wb")
+    downloader = MediaIoBaseDownload(fh, request)
 
-done = False
-while not done:
-    _, done = downloader.next_chunk()
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
 
-print("⬇️ Download completed")
+    print("⬇️ Download completed")
+    return name
 
-
-# ==================================================
-# GET TITLE + TAGS
-# ==================================================
-TITLE, TAG_LIST, TAG_TEXT = get_title_from_file("titles.txt")
-
-print("📝 Title:", TITLE)
-print("🏷️ Tags:", TAG_LIST)
-
-
-# ==================================================
-# YOUTUBE UPLOAD (SCHEDULED)
-# ==================================================
-body = {
-    "snippet": {
-        "title": TITLE,
-        "description": f"{TAG_TEXT}\n\nAI generated Hulk meme",
-        "categoryId": "24",          # Entertainment
-        "tags": TAG_LIST
-    },
-    "status": {
-        "privacyStatus": "private",
-        "publishAt": publish_at,
-        "selfDeclaredMadeForKids": False
-    },
-    "contentDetails": {
-        "hasAlteredContent": True
+# =========================
+# UPLOAD TO YOUTUBE
+# =========================
+def upload_to_youtube(path, title, description, tags, publish_time):
+    body = {
+        "snippet": {
+            "title": title[:95],
+            "description": description,
+            "tags": tags,
+            "categoryId": "24"
+        },
+        "status": {
+            "privacyStatus": "private",
+            "publishAt": publish_time,
+            "selfDeclaredMadeForKids": False
+        }
     }
-}
 
-media = MediaFileUpload("video.mp4", resumable=True)
+    media = MediaFileUpload(path, resumable=True)
 
-response = youtube.videos().insert(
-    part="snippet,status,contentDetails",
-    body=body,
-    media_body=media
-).execute()
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media
+    )
 
-print("📤 YouTube upload successful:", response["id"])
+    response = request.execute()
+    print("✅ YouTube upload successful:", response["id"])
 
+# =========================
+# MOVE FILE AFTER UPLOAD
+# =========================
+def move_file(file_id):
+    drive.files().update(
+        fileId=file_id,
+        addParents=UPLOADED_FOLDER_ID,
+        removeParents=PENDING_FOLDER_ID
+    ).execute()
 
-# ==================================================
-# MOVE ONLY SHORTCUT (SAFE)
-# ==================================================
-meta = drive.files().get(
-    fileId=file_id,
-    fields="parents"
-).execute()
+# =========================
+# MAIN
+# =========================
+def main():
+    print("🚀 Bot started")
 
-previous_parents = ",".join(meta.get("parents", []))
+    title, tags = get_title_from_file()
+    description = build_description(title, tags)
+    publish_time = get_publish_time()
 
-drive.files().update(
-    fileId=file_id,
-    addParents=UPLOADED_FOLDER_ID,
-    removeParents=previous_parents,
-    fields="id, parents"
-).execute()
+    file_id, name, shortcut_id = get_next_video()
+    path = download_video(file_id, name)
 
-print("📁 Shortcut moved to UPLOADED folder")
-print("✅ Bot finished successfully")
+    upload_to_youtube(path, title, description, tags, publish_time)
+
+    move_file(shortcut_id or file_id)
+
+    print("🎉 DONE")
+
+if __name__ == "__main__":
+    main()
