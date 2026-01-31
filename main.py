@@ -1,34 +1,29 @@
-import os
-import json
+import os, json
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 print("Bot started")
 
-# Load OAuth JSON from GitHub Secret
-oauth_json = os.getenv("GOOGLE_OAUTH_JSON")
-if not oauth_json:
-    raise Exception("OAuth secret not found")
+token_json = os.getenv("GOOGLE_TOKEN_JSON")
+if not token_json:
+    raise Exception("Token secret not found")
 
-client_config = json.loads(oauth_json)
+token_info = json.loads(token_json)
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/youtube.upload"
+]
 
-flow = InstalledAppFlow.from_client_config(
-    client_config,
-    scopes=SCOPES
-)
-
-creds = flow.run_console()
+creds = Credentials.from_authorized_user_info(token_info, SCOPES)
 
 drive = build("drive", "v3", credentials=creds)
 
-# 🔴 YAHAN APNA PENDING FOLDER ID DALO
+# 🔴 PENDING folder ID yahan paste karo
 PENDING_FOLDER_ID = "17fDjO4OLjVCKrvp80GFeyRq7RJqVViAz"
 
 results = drive.files().list(
-    q=f"'{PENDING_FOLDER_ID}' in parents and trashed = false",
+    q=f"'{PENDING_FOLDER_ID}' in parents and trashed=false",
     fields="files(id, name)"
 ).execute()
 
@@ -40,3 +35,4 @@ else:
     print("Found pending videos:")
     for f in files:
         print("-", f["name"])
+
