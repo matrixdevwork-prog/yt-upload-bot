@@ -2,183 +2,149 @@ import os
 import json
 import io
 from datetime import datetime, timedelta
-import pytz
+from zoneinfo import ZoneInfo
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 
-# =========================
-# ENV VARIABLES
-# =========================
-TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
+# ---------------- CONFIG ----------------
+IST = ZoneInfo("Asia/Kolkata")
+
+GOOGLE_TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
 PENDING_FOLDER_ID = os.getenv("PENDING_FOLDER_ID")
 UPLOADED_FOLDER_ID = os.getenv("UPLOADED_FOLDER_ID")
 
-if not TOKEN_JSON:
-    raise Exception("GOOGLE_TOKEN_JSON missing")
+if not all([GOOGLE_TOKEN_JSON, PENDING_FOLDER_ID, UPLOADED_FOLDER_ID]):
+    raise Exception("Missing required environment variables")
 
-# =========================
-# AUTH
-# =========================
-creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON))
+# ---------------- AUTH ----------------
+creds = Credentials.from_authorized_user_info(
+    json.loads(GOOGLE_TOKEN_JSON),
+    scopes=[
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/youtube.upload",
+    ],
+)
+
 drive = build("drive", "v3", credentials=creds)
 youtube = build("youtube", "v3", credentials=creds)
 
-print("✅ Environment variables loaded")
-
-# =========================
-# TITLE + TAG PICKER
-# =========================
+# ---------------- TITLE HANDLER ----------------
 def get_title_from_file(path="titles.txt"):
-    if not os.path.exists(path):
-        raise Exception("titles.txt not found in repo root")
-
     with open(path, "r", encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip()]
 
     if not lines:
-        raise Exception("titles.txt is empty")
+        raise Exception("titles.txt empty")
 
     first = lines[0]
-    remaining = lines[1:]
+    rest = lines[1:]
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(remaining))
+        f.write("\n".join(rest))
 
     title, tags = first.split("|")
-    tag_list = [t.strip() for t in tags.split(",")]
+    tags = [t.strip() for t in tags.split(",")]
 
-    return title.strip(), tag_list
+    return title.strip(), tags
 
-# =========================
-# DESCRIPTION BUILDER
-# =========================
-def build_description(title, tags):
-    hashtags = " ".join([f"#{t}" for t in tags])
+# ---------------- DRIVE ----------------
+def resolve_shortcut(file):
+    if file["mimeType"] == "application/vnd.google-apps.shortcut":
+        target_id = file["shortcutDetails"]["targetId"]
+        return drive.files().get(fileId=target_id, fields="id,name,mimeType").execute()
+    return file
 
-    return f"""
-{title}
-
-🔥 Hulk AI Viral Short
-😂 Funny AI Generated Content
-🤖 Altered / AI Based Video
-
-{hashtags}
-""".strip()
-
-# =========================
-# SCHEDULE LOGIC (IST)
-# =========================
-def get_publish_time():
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
-
-    if now.hour < 7:
-        publish = now.replace(hour=8, minute=0, second=0)
-    elif now.hour < 13:
-        publish = now.replace(hour=14, minute=0, second=0)
-    else:
-        publish = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0)
-
-    print("📅 Scheduled publish (IST):", publish.strftime("%Y-%m-%d %H:%M"))
-    return publish.astimezone(pytz.utc).isoformat()
-
-# =========================
-# GET NEXT VIDEO
-# =========================
-def get_next_video():
-    results = drive.files().list(
-        q=f"'{PENDING_FOLDER_ID}' in parents and trashed=false",
-        fields="files(id,name,mimeType,shortcutDetails)"
-    ).execute()
-
-    files = results.get("files", [])
-    if not files:
-        raise Exception("No videos in pending folder")
-
-    f = files[0]
-
-    # Handle shortcut
-    if f["mimeType"] == "application/vnd.google-apps.shortcut":
-        real_id = f["shortcutDetails"]["targetId"]
-        real = drive.files().get(fileId=real_id, fields="id,name").execute()
-        return real["id"], real["name"], f["id"]
-
-    return f["id"], f["name"], None
-
-# =========================
-# DOWNLOAD VIDEO
-# =========================
-def download_video(file_id, name):
-    request = drive.files().get_media(fileId=file_id)
-    fh = io.FileIO(name, "wb")
+def download_video(file):
+    request = drive.files().get_media(fileId=file["id"])
+    fh = io.FileIO("video.mp4", "wb")
     downloader = MediaIoBaseDownload(fh, request)
 
     done = False
     while not done:
         _, done = downloader.next_chunk()
 
-    print("⬇️ Download completed")
-    return name
+    fh.close()
 
-# =========================
-# UPLOAD TO YOUTUBE
-# =========================
-def upload_to_youtube(path, title, description, tags, publish_time):
-    body = {
-        "snippet": {
-            "title": title[:95],
-            "description": description,
-            "tags": tags,
-            "categoryId": "24"
-        },
-        "status": {
-            "privacyStatus": "private",
-            "publishAt": publish_time,
-            "selfDeclaredMadeForKids": False
-        }
-    }
+# ---------------- SCHEDULE LOGIC ----------------
+def get_next_schedule():
+    now = datetime.now(IST)
 
-    media = MediaFileUpload(path, resumable=True)
+    today_8 = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    today_14 = now.replace(hour=14, minute=0, second=0, microsecond=0)
 
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media
-    )
+    if now < today_8:
+        return today_8
+    elif now < today_14:
+        return today_14
+    else:
+        return (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
 
-    response = request.execute()
-    print("✅ YouTube upload successful:", response["id"])
-
-# =========================
-# MOVE FILE AFTER UPLOAD
-# =========================
-def move_file(file_id):
-    drive.files().update(
-        fileId=file_id,
-        addParents=UPLOADED_FOLDER_ID,
-        removeParents=PENDING_FOLDER_ID
-    ).execute()
-
-# =========================
-# MAIN
-# =========================
+# ---------------- MAIN ----------------
 def main():
     print("🚀 Bot started")
 
     title, tags = get_title_from_file()
-    description = build_description(title, tags)
-    publish_time = get_publish_time()
+    print("📝 Title:", title)
+    print("🏷️ Tags:", tags)
 
-    file_id, name, shortcut_id = get_next_video()
-    path = download_video(file_id, name)
+    results = drive.files().list(
+        q=f"'{PENDING_FOLDER_ID}' in parents",
+        fields="files(id,name,mimeType,shortcutDetails)",
+        pageSize=1,
+    ).execute()
 
-    upload_to_youtube(path, title, description, tags, publish_time)
+    if not results["files"]:
+        print("No pending videos")
+        return
 
-    move_file(shortcut_id or file_id)
+    file = resolve_shortcut(results["files"][0])
+    print("📥 Downloading:", file["name"])
+    download_video(file)
 
-    print("🎉 DONE")
+    schedule_time = get_next_schedule()
+    print("⏰ Scheduled (IST):", schedule_time)
 
+    body = {
+        "snippet": {
+            "title": title[:100],
+            "description": f"{title}\n\n#shorts",
+            "tags": tags[:15],
+            "categoryId": "24",  # Entertainment
+        },
+        "status": {
+            "privacyStatus": "private",
+            "publishAt": schedule_time.isoformat(),
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+    media = MediaFileUpload("video.mp4", chunksize=-1, resumable=True)
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+
+    video_id = response["id"]
+    print("✅ Uploaded:", video_id)
+
+    # Move file in Drive
+    drive.files().update(
+        fileId=file["id"],
+        addParents=UPLOADED_FOLDER_ID,
+        removeParents=PENDING_FOLDER_ID,
+    ).execute()
+
+    print("📁 Moved to uploaded folder")
+
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     main()
