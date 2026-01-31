@@ -1,18 +1,15 @@
 import os
-import json
 import io
-import mimetypes
+import json
+import tempfile
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-from googleapiclient.errors import HttpError
 
-print("Bot started")
-
-# -------------------------------------------------
-# ENV VARIABLES (GitHub Secrets)
-# -------------------------------------------------
+# =========================
+# ENV VARIABLES
+# =========================
 TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
 PENDING_FOLDER_ID = os.getenv("PENDING_FOLDER_ID")
 UPLOADED_FOLDER_ID = os.getenv("UPLOADED_FOLDER_ID")
@@ -24,131 +21,131 @@ if not PENDING_FOLDER_ID:
 if not UPLOADED_FOLDER_ID:
     raise Exception("UPLOADED_FOLDER_ID not found in environment")
 
-token_info = json.loads(TOKEN_JSON)
+print("Bot started")
 
-SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/youtube.upload"
-]
-
-creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+# =========================
+# AUTH
+# =========================
+creds = Credentials.from_authorized_user_info(
+    json.loads(TOKEN_JSON),
+    scopes=[
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/youtube.upload",
+    ],
+)
 
 drive = build("drive", "v3", credentials=creds)
 youtube = build("youtube", "v3", credentials=creds)
 
-# -------------------------------------------------
-# STEP 1: Get one file from PENDING
-# -------------------------------------------------
-res = drive.files().list(
-    q=f"'{PENDING_FOLDER_ID}' in parents and trashed=false",
+# =========================
+# GET ONE FILE FROM PENDING
+# =========================
+results = drive.files().list(
+    q=f"'{PENDING_FOLDER_ID}' in parents and trashed = false",
     fields="files(id, name, mimeType)",
-    orderBy="createdTime"
+    pageSize=1
 ).execute()
 
-files = res.get("files", [])
+files = results.get("files", [])
 if not files:
-    print("No pending videos found")
+    print("No files found in PENDING folder")
     exit(0)
 
-video = files[0]
-file_id = video["id"]
-file_name = video["name"]
-mime_type = video["mimeType"]
+file = files[0]
+file_id = file["id"]
+file_name = file["name"]
+mime_type = file["mimeType"]
 
 print(f"Selected file: {file_name}")
 print(f"MIME type: {mime_type}")
 
-# -------------------------------------------------
-# STEP 2: Handle Drive SHORTCUT
-# -------------------------------------------------
+# =========================
+# SHORTCUT RESOLVE
+# =========================
+real_file_id = file_id
+
 if mime_type == "application/vnd.google-apps.shortcut":
     print("Shortcut detected. Resolving real file...")
-
-    shortcut_info = drive.files().get(
+    shortcut_meta = drive.files().get(
         fileId=file_id,
         fields="shortcutDetails"
     ).execute()
 
-    target_id = shortcut_info["shortcutDetails"]["targetId"]
+    real_file_id = shortcut_meta["shortcutDetails"]["targetId"]
 
-    real_file = drive.files().get(
-        fileId=target_id,
-        fields="id, name, mimeType"
+    real_meta = drive.files().get(
+        fileId=real_file_id,
+        fields="name, mimeType"
     ).execute()
 
-    file_id = real_file["id"]
-    file_name = real_file["name"]
-    mime_type = real_file["mimeType"]
+    file_name = real_meta["name"]
+    mime_type = real_meta["mimeType"]
 
     print(f"Resolved to real file: {file_name}")
     print(f"Real MIME type: {mime_type}")
 
-# -------------------------------------------------
-# STEP 3: Validate real video file
-# -------------------------------------------------
-if not mime_type.startswith("video/"):
-    raise Exception(f"Not a video file. MIME type = {mime_type}")
-
-# -------------------------------------------------
-# STEP 4: Download from Drive
-# -------------------------------------------------
-local_path = f"/tmp/{file_name}"
-
-request = drive.files().get_media(fileId=file_id)
-fh = io.FileIO(local_path, "wb")
+# =========================
+# DOWNLOAD FILE
+# =========================
+request = drive.files().get_media(fileId=real_file_id)
+fh = io.BytesIO()
 downloader = MediaIoBaseDownload(fh, request)
 
 done = False
 while not done:
     status, done = downloader.next_chunk()
 
+fh.seek(0)
+
+tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+tmp.write(fh.read())
+tmp.close()
+
 print("Download completed")
 
-# -------------------------------------------------
-# STEP 5: Upload to YouTube (PRIVATE)
-# -------------------------------------------------
-yt_mime = mimetypes.guess_type(local_path)[0] or "video/mp4"
-
+# =========================
+# YOUTUBE UPLOAD
+# =========================
 body = {
     "snippet": {
-        "title": file_name.rsplit(".", 1)[0],
-        "description": "Auto uploaded by bot",
-        "tags": ["automation"],
+        "title": file_name.replace(".mp4", ""),
+        "description": "Automated upload",
         "categoryId": "22"
     },
     "status": {
-        "privacyStatus": "private"
+        "privacyStatus": "public"
     }
 }
 
-media = MediaFileUpload(
-    local_path,
-    mimetype=yt_mime,
-    resumable=True
+media = MediaFileUpload(tmp.name, resumable=True)
+
+upload_request = youtube.videos().insert(
+    part="snippet,status",
+    body=body,
+    media_body=media
 )
 
-try:
-    req = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media
-    )
-    resp = req.execute()
-    yt_video_id = resp.get("id")
-    print(f"YouTube upload successful. Video ID: {yt_video_id}")
+response = upload_request.execute()
+video_id = response["id"]
 
-except HttpError as e:
-    raise Exception(f"YouTube upload failed: {e}")
+print(f"YouTube upload successful. Video ID: {video_id}")
 
-# -------------------------------------------------
-# STEP 6: Move original Drive file to UPLOADED
-# -------------------------------------------------
+# =========================
+# MOVE FILE (REPLACE PARENT)
+# =========================
+meta = drive.files().get(
+    fileId=real_file_id,
+    fields="parents"
+).execute()
+
+previous_parents = ",".join(meta.get("parents", []))
+
 drive.files().update(
-    fileId=file_id,
+    fileId=real_file_id,
     addParents=UPLOADED_FOLDER_ID,
-    removeParents=PENDING_FOLDER_ID,
+    removeParents=previous_parents,
     fields="id, parents"
 ).execute()
 
-print("Moved video to UPLOADED folder")
+print("File moved to UPLOADED folder successfully")
 print("Bot finished successfully")
