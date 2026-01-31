@@ -1,37 +1,35 @@
 import os
 import json
-import io
-from datetime import datetime, timedelta
+import random
+import datetime
 from zoneinfo import ZoneInfo
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 
-# ---------------- CONFIG ----------------
-IST = ZoneInfo("Asia/Kolkata")
-
-GOOGLE_TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
+# =======================
+# ENV VARIABLES
+# =======================
+TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
 PENDING_FOLDER_ID = os.getenv("PENDING_FOLDER_ID")
 UPLOADED_FOLDER_ID = os.getenv("UPLOADED_FOLDER_ID")
 
-if not all([GOOGLE_TOKEN_JSON, PENDING_FOLDER_ID, UPLOADED_FOLDER_ID]):
-    raise Exception("Missing required environment variables")
+if not TOKEN_JSON:
+    raise Exception("GOOGLE_TOKEN_JSON missing")
 
-# ---------------- AUTH ----------------
-creds = Credentials.from_authorized_user_info(
-    json.loads(GOOGLE_TOKEN_JSON),
-    scopes=[
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/youtube.upload",
-    ],
-)
-
+# =======================
+# LOAD GOOGLE CREDS
+# =======================
+creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON))
 drive = build("drive", "v3", credentials=creds)
 youtube = build("youtube", "v3", credentials=creds)
 
-# ---------------- TITLE HANDLER ----------------
+print("✅ Environment variables loaded")
+
+# =======================
+# READ TITLE FROM FILE
+# =======================
 def get_title_from_file(path="titles.txt"):
     with open(path, "r", encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip()]
@@ -39,112 +37,119 @@ def get_title_from_file(path="titles.txt"):
     if not lines:
         raise Exception("titles.txt empty")
 
-    first = lines[0]
-    rest = lines[1:]
+    line = lines.pop(0)
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(rest))
+        f.write("\n".join(lines))
 
-    title, tags = first.split("|")
-    tags = [t.strip() for t in tags.split(",")]
+    title_part, tag_part = line.split("|")
+    title = title_part.strip()
+    tags = [t.strip() for t in tag_part.split(",")]
 
-    return title.strip(), tags
+    return title, tags
 
-# ---------------- DRIVE ----------------
-def resolve_shortcut(file):
-    if file["mimeType"] == "application/vnd.google-apps.shortcut":
-        target_id = file["shortcutDetails"]["targetId"]
-        return drive.files().get(fileId=target_id, fields="id,name,mimeType").execute()
-    return file
+# =======================
+# GET VIDEO FROM DRIVE
+# =======================
+def get_video_file():
+    res = drive.files().list(
+        q=f"'{PENDING_FOLDER_ID}' in parents and mimeType contains 'video/'",
+        fields="files(id,name)"
+    ).execute()
 
-def download_video(file):
-    request = drive.files().get_media(fileId=file["id"])
-    fh = io.FileIO("video.mp4", "wb")
-    downloader = MediaIoBaseDownload(fh, request)
+    files = res.get("files", [])
+    if not files:
+        raise Exception("No video found")
 
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
+    return random.choice(files)
 
-    fh.close()
+# =======================
+# DOWNLOAD VIDEO
+# =======================
+def download_file(file_id, name):
+    request = drive.files().get_media(fileId=file_id)
+    with open(name, "wb") as f:
+        f.write(request.execute())
 
-# ---------------- SCHEDULE LOGIC ----------------
-def get_next_schedule():
-    now = datetime.now(IST)
+# =======================
+# MOVE FILE AFTER UPLOAD
+# =======================
+def move_file(file_id):
+    drive.files().update(
+        fileId=file_id,
+        addParents=UPLOADED_FOLDER_ID,
+        removeParents=PENDING_FOLDER_ID
+    ).execute()
 
-    today_8 = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    today_14 = now.replace(hour=14, minute=0, second=0, microsecond=0)
+# =======================
+# SCHEDULE TIME (IST)
+# =======================
+def get_publish_time():
+    ist = ZoneInfo("Asia/Kolkata")
+    now = datetime.datetime.now(ist)
 
-    if now < today_8:
-        return today_8
-    elif now < today_14:
-        return today_14
+    if now.hour < 7:
+        publish = now.replace(hour=8, minute=0)
+    elif now.hour < 13:
+        publish = now.replace(hour=14, minute=0)
     else:
-        return (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+        publish = (now + datetime.timedelta(days=1)).replace(hour=8, minute=0)
 
-# ---------------- MAIN ----------------
+    return publish.astimezone(datetime.timezone.utc).isoformat()
+
+# =======================
+# UPLOAD TO YOUTUBE
+# =======================
+def upload_video(path, title, tags, publish_time):
+    body = {
+        "snippet": {
+            "title": title,
+            "description": "",
+            "tags": tags,
+            "categoryId": "24"  # Entertainment
+        },
+        "status": {
+            "privacyStatus": "private",
+            "publishAt": publish_time,
+            "selfDeclaredMadeForKids": False
+        }
+    }
+
+    media = MediaFileUpload(path, chunksize=-1, resumable=True)
+
+    req = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media
+    )
+
+    res = req.execute()
+    return res["id"]
+
+# =======================
+# MAIN
+# =======================
 def main():
     print("🚀 Bot started")
 
     title, tags = get_title_from_file()
-    print("📝 Title:", title)
+    print("📌 Title:", title)
     print("🏷️ Tags:", tags)
 
-    results = drive.files().list(
-        q=f"'{PENDING_FOLDER_ID}' in parents",
-        fields="files(id,name,mimeType,shortcutDetails)",
-        pageSize=1,
-    ).execute()
+    video = get_video_file()
+    print("🎬 Selected:", video["name"])
 
-    if not results["files"]:
-        print("No pending videos")
-        return
+    download_file(video["id"], video["name"])
+    print("⬇️ Download completed")
 
-    file = resolve_shortcut(results["files"][0])
-    print("📥 Downloading:", file["name"])
-    download_video(file)
+    publish_time = get_publish_time()
+    print("⏰ Scheduled (UTC):", publish_time)
 
-    schedule_time = get_next_schedule()
-    print("⏰ Scheduled (IST):", schedule_time)
+    video_id = upload_video(video["name"], title, tags, publish_time)
+    print("✅ Uploaded. Video ID:", video_id)
 
-    body = {
-        "snippet": {
-            "title": title[:100],
-            "description": f"{title}\n\n#shorts",
-            "tags": tags[:15],
-            "categoryId": "24",  # Entertainment
-        },
-        "status": {
-            "privacyStatus": "private",
-            "publishAt": schedule_time.isoformat(),
-            "selfDeclaredMadeForKids": False,
-        },
-    }
+    move_file(video["id"])
+    print("📁 Moved file to uploaded folder")
 
-    media = MediaFileUpload("video.mp4", chunksize=-1, resumable=True)
-
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media,
-    )
-
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-
-    video_id = response["id"]
-    print("✅ Uploaded:", video_id)
-
-    # Move file in Drive
-    drive.files().update(
-        fileId=file["id"],
-        addParents=UPLOADED_FOLDER_ID,
-        removeParents=PENDING_FOLDER_ID,
-    ).execute()
-
-    print("📁 Moved to uploaded folder")
-
-# ---------------- RUN ----------------
 if __name__ == "__main__":
     main()
