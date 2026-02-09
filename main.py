@@ -9,46 +9,49 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
 
-# ========== ENV ==========
+# ================== ENV ==================
 TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
 PENDING_FOLDER_ID = os.getenv("PENDING_FOLDER_ID")
 UPLOADED_FOLDER_ID = os.getenv("UPLOADED_FOLDER_ID")
 
 if not all([TOKEN_JSON, PENDING_FOLDER_ID, UPLOADED_FOLDER_ID]):
-    raise Exception("Missing required environment variables")
+    raise Exception("❌ Missing environment variables")
 
 
-# ========== AUTH ==========
+# ================== AUTH ==================
 creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON))
 drive = build("drive", "v3", credentials=creds)
 youtube = build("youtube", "v3", credentials=creds)
 
 
-# ========== TITLES ==========
+# ================== TITLES ==================
+# Format:
+# Aree Hulk Gussa 😂 #hulkai #funny #viralshorts | hulkai,funny,viralshorts
+
 def get_title_from_file(path="titles.txt"):
     with open(path, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f.readlines() if l.strip()]
+        lines = [l.strip() for l in f if l.strip()]
 
     if not lines:
-        raise Exception("titles.txt empty")
+        raise Exception("❌ titles.txt empty")
 
     line = lines[0]
 
-    # Format:
-    # Title 😂 #tag1 #tag2 | tag1,tag2,tag3
-    title_part, tag_part = line.split("|")
-    title = title_part.strip()
+    if "|" not in line:
+        raise Exception("❌ Invalid title format")
 
+    title_part, tag_part = line.split("|", 1)
+    title = title_part.strip()
     tags = [t.strip() for t in tag_part.split(",") if t.strip()]
 
-    # remove used line
+    # remove used title
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines[1:]))
 
     return title, tags
 
 
-# ========== DRIVE ==========
+# ================== DRIVE ==================
 def get_video_file():
     res = drive.files().list(
         q=f"'{PENDING_FOLDER_ID}' in parents and trashed=false",
@@ -57,7 +60,7 @@ def get_video_file():
 
     files = res.get("files", [])
     if not files:
-        raise Exception("No video found")
+        raise Exception("❌ No video found in pending folder")
 
     return random.choice(files)
 
@@ -90,34 +93,32 @@ def move_file(file_id):
         fileId=file_id,
         addParents=UPLOADED_FOLDER_ID,
         removeParents=PENDING_FOLDER_ID,
-        fields="id, parents"
+        fields="id"
     ).execute()
 
 
-# ========== SCHEDULING ==========
+# ================== SCHEDULE ==================
 def get_schedule_time():
     ist = ZoneInfo("Asia/Kolkata")
     now = datetime.now(ist)
 
-    today_8 = datetime.combine(now.date(), time(8, 0), ist)
-    today_14 = datetime.combine(now.date(), time(14, 0), ist)
+    target = datetime.combine(now.date(), time(14, 0), ist)
 
-    if now < today_8 - timedelta(hours=1):
-        return today_8
-    elif now < today_14 - timedelta(hours=1):
-        return today_14
-    else:
-        return datetime.combine(now.date() + timedelta(days=1), time(8, 0), ist)
+    # agar 1 ghanta pehle nahi chala to next day
+    if now > target - timedelta(hours=1):
+        target = datetime.combine(now.date() + timedelta(days=1), time(14, 0), ist)
+
+    return target
 
 
-# ========== YOUTUBE ==========
+# ================== YOUTUBE ==================
 def upload_to_youtube(video_path, title, tags, publish_time):
     body = {
         "snippet": {
             "title": title,
-            "description": "",   # intentionally empty
+            "description": "",
             "tags": tags,
-            "categoryId": "24"   # Entertainment
+            "categoryId": "24"  # Entertainment
         },
         "status": {
             "privacyStatus": "private",
@@ -128,17 +129,17 @@ def upload_to_youtube(video_path, title, tags, publish_time):
 
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
 
-    req = youtube.videos().insert(
+    request = youtube.videos().insert(
         part="snippet,status",
         body=body,
         media_body=media
     )
 
-    res = req.execute()
-    return res["id"]
+    response = request.execute()
+    return response["id"]
 
 
-# ========== MAIN ==========
+# ================== MAIN ==================
 def main():
     print("🚀 Bot started")
 
@@ -159,7 +160,7 @@ def main():
     print("✅ Uploaded:", video_id)
 
     move_file(file["id"])
-    print("📁 Moved to uploaded folder")
+    print("📁 Moved video to uploaded folder")
 
 
 if __name__ == "__main__":
