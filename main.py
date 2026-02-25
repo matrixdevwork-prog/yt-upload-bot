@@ -9,26 +9,26 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
 
-# ========= ENV =========
+# ================= ENV =================
 TOKEN_JSON = os.getenv("GOOGLE_TOKEN_JSON")
 
-PENDING_FOLDER_0 = os.getenv("PENDING_FOLDER_ID_0")
-PENDING_FOLDER_1 = os.getenv("PENDING_FOLDER_ID_1")
+PENDING_FOLDER_ID_0 = os.getenv("PENDING_FOLDER_ID_0")
+PENDING_FOLDER_ID_1 = os.getenv("PENDING_FOLDER_ID_1")
 
 UPLOADED_FOLDER_ID = os.getenv("UPLOADED_FOLDER_ID")
 
-if not all([TOKEN_JSON, PENDING_FOLDER_0, PENDING_FOLDER_1, UPLOADED_FOLDER_ID]):
+if not all([TOKEN_JSON, PENDING_FOLDER_ID_0, PENDING_FOLDER_ID_1, UPLOADED_FOLDER_ID]):
     raise Exception("Missing environment variables")
 
 
-# ========= AUTH =========
+# ================= AUTH =================
 creds = Credentials.from_authorized_user_info(json.loads(TOKEN_JSON))
 
 drive = build("drive", "v3", credentials=creds)
 youtube = build("youtube", "v3", credentials=creds)
 
 
-# ========= TITLE =========
+# ================= TITLE =================
 def get_title_from_file(path="titles.txt"):
     with open(path, "r", encoding="utf-8") as f:
         lines = [l.strip() for l in f.readlines() if l.strip()]
@@ -36,20 +36,24 @@ def get_title_from_file(path="titles.txt"):
     if not lines:
         raise Exception("titles.txt empty")
 
-    title = lines[0]
+    line = lines[0]
 
-    # remove used line
+    if "|" in line:
+        title_part, tag_part = line.split("|", 1)
+        title = title_part.strip()
+        tags = [t.strip() for t in tag_part.split(",") if t.strip()]
+    else:
+        title = line
+        tags = [w[1:] for w in title.split() if w.startswith("#")]
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines[1:]))
-
-    # extract tags from hashtags
-    tags = [w[1:] for w in title.split() if w.startswith("#")]
 
     return title, tags
 
 
-# ========= DRIVE =========
-def list_files(folder_id):
+# ================= DRIVE =================
+def list_folder(folder_id):
     res = drive.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id,name,mimeType,shortcutDetails)"
@@ -59,20 +63,19 @@ def list_files(folder_id):
 
 
 def pick_video():
-    # 🔥 priority folder first
-    files = list_files(PENDING_FOLDER_1)
+    files_priority = list_folder(PENDING_FOLDER_ID_1)
 
-    if files:
-        print("📁 Using priority folder")
-        return random.choice(files), PENDING_FOLDER_1
+    if files_priority:
+        print("Using PRIORITY folder")
+        return random.choice(files_priority), PENDING_FOLDER_ID_1
 
-    print("📁 Using fallback folder")
-    files = list_files(PENDING_FOLDER_0)
+    files_fallback = list_folder(PENDING_FOLDER_ID_0)
 
-    if not files:
-        raise Exception("No videos in both folders")
+    if files_fallback:
+        print("Using FALLBACK folder")
+        return random.choice(files_fallback), PENDING_FOLDER_ID_0
 
-    return random.choice(files), PENDING_FOLDER_0
+    raise Exception("No video in any pending folder")
 
 
 def resolve_shortcut(file):
@@ -107,20 +110,20 @@ def move_file(file_id, from_folder):
     ).execute()
 
 
-# ========= SCHEDULE =========
+# ================= SCHEDULE =================
 def get_schedule_time():
     ist = ZoneInfo("Asia/Kolkata")
     now = datetime.now(ist)
 
     target = datetime.combine(now.date(), time(14, 0), ist)
 
-    if now >= target - timedelta(hours=2):
-        target = datetime.combine(now.date() + timedelta(days=1), time(14, 0), ist)
+    if now >= target:
+        target = target + timedelta(days=1)
 
     return target
 
 
-# ========= YOUTUBE =========
+# ================= UPLOAD =================
 def upload(video_path, title, tags, publish_time):
     body = {
         "snippet": {
@@ -148,27 +151,28 @@ def upload(video_path, title, tags, publish_time):
     return res["id"]
 
 
-# ========= MAIN =========
+# ================= MAIN =================
 def main():
-    print("🚀 Bot started")
+    print("Bot started")
 
     title, tags = get_title_from_file()
-    print("📝 Title:", title)
+    print("Title:", title)
+    print("Tags:", tags)
 
     file, source_folder = pick_video()
     file = resolve_shortcut(file)
 
     video_path = download_video(file)
-    print("⬇️ Downloaded:", video_path)
+    print("Downloaded:", video_path)
 
-    schedule_time = get_schedule_time()
-    print("⏰ Scheduled IST:", schedule_time)
+    publish_time = get_schedule_time()
+    print("Scheduled IST:", publish_time)
 
-    video_id = upload(video_path, title, tags, schedule_time)
-    print("✅ Uploaded:", video_id)
+    vid = upload(video_path, title, tags, publish_time)
+    print("Uploaded:", vid)
 
     move_file(file["id"], source_folder)
-    print("📦 Moved to uploaded folder")
+    print("Moved to uploaded folder")
 
 
 if __name__ == "__main__":
